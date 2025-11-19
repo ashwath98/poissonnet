@@ -117,7 +117,7 @@ def bake_dataset(train, num_samples=None, num_dupes=1, body_shape_std=1.0):
     baked_tar_betas = []
     genders_list = []
     print('Baking dataset...')
-    for (pose_pair, lhand_pair, rhand_pair) in zip(pose_pairs, lhand_pairs, rhand_pairs):
+    for (pose_pair, lhand_pair, rhand_pair) in tqdm.tqdm(zip(pose_pairs, lhand_pairs, rhand_pairs), total=len(pose_pairs), desc='Generating meshes'):
         gender = random.choice(genders)
         body_model_params = dict(model_path=SMPLX_MODEL_PATH,
                                     model_type='smplx',
@@ -174,7 +174,7 @@ def bake_dataset(train, num_samples=None, num_dupes=1, body_shape_std=1.0):
     baked_tar_verts = torch.stack(baked_tar_verts, dim=0)
     baked_tar_feats = torch.stack(baked_tar_feats, dim=0)
     baked_tar_betas = torch.stack(baked_tar_betas, dim=0)
-    genders_list = torch.stack(genders_list, dim=0, dtype=torch.int64)
+    genders_list = torch.tensor(genders_list, dtype=torch.int64)
 
     # Export to torch files:
     hand_suffix = 'hands' if USE_HANDS else 'noHands'

@@ -213,11 +213,181 @@ class PoissonBlock(nn.Module):
                             gradient_features, 
                             extra_features=extra_features, 
                             mass=vertex_mass if self.mass_norm else None)
+        
+        return out, grads
+    
+class PoissonBlockWithAttention(nn.Module):
+    def __init__(self, in_c, out_c, width, extra_feats=0, config={}):
+        super().__init__()
+        drop_path = config.get('drop_path', 0.0)
+        dropout_p = config.get('dropout_p', 0.0)
+        cmlp_nlayers = config.get('cmlp_nlayers', 2)
+        mlp_norm = config.get('mlp_norm', False)
+        self.mass_norm = config.get('mass_norm', False)
+        self.inner_prod_features = config.get('inner_prod_features', False)
+        self.cmlp_modulate = config.get('cmlp_modulate', True)
+        self.use_mass_attention = config.get('use_mass_attention', False)
+
+        # Ensure out_c is divisible by 3 for Q, K, V split
+        assert out_c % 3 == 0, f"out_c ({out_c}) must be divisible by 3 for attention"
+        self.qkv_dim = out_c // 3
+        
+        self.grad_mlp = ComplexMLP(in_c=in_c, out_c=out_c, width=width, num_layers=cmlp_nlayers, modulate=self.cmlp_modulate)
+
+        mlp_in = in_c + out_c # [x_in, pde_sol]
+        if self.inner_prod_features: # optional
+            self.grad_features = ComplexLayer(in_c=out_c, out_c=out_c, nonlin=False)
+            self.grad_scaler = nn.Parameter(1e-2 * torch.ones(out_c), requires_grad=True)
+            mlp_in += out_c
+            
+        # The MLP outputs features that will be split into Q, K, V
+        self.vert_mlp = PoissonBlockMLP(in_c=mlp_in, out_c=out_c, width=width, drop_path=drop_path, drop=dropout_p, grad_inputs=self.inner_prod_features, norm=mlp_norm, extra_feats=extra_feats)
+        
+        # Projection layer after attention to ensure output dimension matches
+        self.attn_proj = nn.Linear(self.qkv_dim, out_c)
+
+    def compute_attention_latent(self, z_verts, vertex_mass):
+        """
+        Compute attention-based features from vertex MLP output.
+        
+        Args:
+            z_verts: Vertex MLP output, shape (B, V, out_c) where out_c must be divisible by 3
+            vertex_mass: Vertex mass, shape (B, V)
+        
+        Returns:
+            attention_map: Attention weights, shape (B, qkv_dim, qkv_dim)
+            V: Value vectors, shape (B, V, qkv_dim)
+        """
+        B, V, C = z_verts.shape
+        F_third = self.qkv_dim
+        
+        if vertex_mass.dim() == 1:
+            vertex_mass = vertex_mass.unsqueeze(0)
+        
+        # Create diagonal mass matrix if using mass attention
+        mass_diag = None
+        if self.use_mass_attention:
+            mass_diag = torch.diag_embed(vertex_mass)
+        
+        # Split into Q, K, V
+        Q = z_verts[:, :, :F_third]          # (B, V, qkv_dim)
+        K = z_verts[:, :, F_third:2*F_third] # (B, V, qkv_dim)
+        V = z_verts[:, :, 2*F_third:]        # (B, V, qkv_dim)
+        
+        # Compute Q.T @ K (or Q.T @ M @ K if using mass)
+        Q_T = Q.transpose(1, 2)  # (B, qkv_dim, V)
+        
+        if self.use_mass_attention:
+            # (B, qkv_dim, V) @ (B, V, V) @ (B, V, qkv_dim) -> (B, qkv_dim, qkv_dim)
+            attention_scores = torch.bmm(torch.bmm(Q_T, mass_diag), K)
+        else:
+            # (B, qkv_dim, V) @ (B, V, qkv_dim) -> (B, qkv_dim, qkv_dim)
+            attention_scores = torch.bmm(Q_T, K)
+        
+        # Scale by sqrt(qkv_dim)
+        attention_scores = attention_scores / (F_third ** 0.5)
+        
+        # Apply softmax to get attention map
+        attention_map = torch.softmax(attention_scores, dim=-1)  # (B, qkv_dim, qkv_dim)
+        
+        return attention_map, V
+
+    def apply_attention_to_value(self, attention_map, V):
+        """
+        Apply attention map to value vectors.
+        
+        Args:
+            attention_map: Attention weights, shape (B, qkv_dim, qkv_dim)
+            V: Value vectors, shape (B, V, qkv_dim)
+        
+        Returns:
+            output: Shape (B, V, qkv_dim)
+        """
+        #B, V, F_third = V.shape
+        
+        # V.T: (B, qkv_dim, V)
+        V_T = V.transpose(1, 2)
+        
+        # attention_map @ V.T: (B, qkv_dim, qkv_dim) @ (B, qkv_dim, V) -> (B, qkv_dim, V)
+        weighted = torch.bmm(attention_map, V_T)
+        
+        # Transpose back to (B, V, qkv_dim)
+        output = weighted.transpose(1, 2)
+        
+        return output
+
+    def forward(self, x_in, M, G, solver, faces, vertex_mass, extra_features=None, **kwargs):
+        '''
+        - x_in:             (B, V, C)   scalar vertex features
+        - M:                (B, 2F)     interleaved face areas [A0, A0, A1, A1, ...]
+        - G:                (B, 2F, V)  intrinsic gradient operator
+        - solver:           [B,]        list of solver objects
+        - faces:            (B, F, 3)   face indices
+        - vertex_mass:      (B, V)      lumped vertex masses
+        - extra_features:   (B, V, C)   additional features to be concatenated to the input of the MLP
+
+        1. Computes transformed gradient features:
+                grads = VectorMLP(∇x_in, x_in)
+        2. Solve Poisson equation: 
+                Lu = ∇ ⋅ (M * grads)
+        3. Compute intermediate vertex features:
+                z = MLP([x_in, u])
+        4. Split z into Q, K, V and compute attention
+        5. Apply attention and project back to out_c dimensions
+        '''
+        B, V, C = x_in.shape
+        F = M.shape[1] // 2
+
+        grads_in = torch.bmm(G, x_in) # (B, 2F, C)
+        x_face = vertices_to_faces(x_in, faces) # (B, F, C)
+        grads = self.grad_mlp(grads_in, x_face) # (B, 2F, C)
+
+        # Solve Poisson equation Lu = ∇^T @ face_areas * grads
+        rhs = torch.bmm(G.transpose(1, 2), M.unsqueeze(-1) * grads) # (B, V, C)
+        u = torch.empty_like(rhs) # container for poisson solve
+        for b in range(B):
+            # solver only accepts 128 simultaneous solves, so split channels if needed -- these for loops should be cheap
+            if rhs.shape[-1] > 128:
+                for j in range(0, rhs.shape[-1], 128):
+                    u[b][:, j:j+128] = PoissonSolver.apply(solver[b], rhs[b][:, j:j+128].contiguous())
+            else:
+                u[b] = PoissonSolver.apply(solver[b], rhs[b].contiguous())
+
+        # nullify area-weighted mean:
+        u = u - torch.sum(u * vertex_mass.unsqueeze(-1), dim=1, keepdim=True) / torch.sum(vertex_mass, dim=1, keepdim=True).unsqueeze(-1)
+
+        # Optionally compute inner products of transformed gradient features -- see DiffusionNet inner-product features https://github.com/nmwsharp/diffusion-net
+        gradient_features = None
+        if self.inner_prod_features:
+            ginX, ginY = grads_in[:, 0::2, :], grads_in[:, 1::2, :]
+            gX, gY = grads[:, 0::2, :], grads[:, 1::2, :]
+            gX, gY = self.grad_features(gX, gY)
+            inner_prod = gX * ginX + gY * ginY # (B, F, C)
+            face_areas = M[:, 0::2] # (B, F)
+            gradient_features = faces_to_vertices(inner_prod, faces, face_areas, num_vertices=V) # (B,V,C)
+            gradient_features = torch.tanh(gradient_features * self.grad_scaler)
+
+        # Get intermediate features from MLP
+        z_verts = self.vert_mlp(x_in, 
+                                u, 
+                                gradient_features, 
+                                extra_features=extra_features, 
+                                mass=vertex_mass if self.mass_norm else None)
+        
+        # Split z_verts into Q, K, V and compute attention
+        import pdb; pdb.set_trace()
+        attention_map, V = self.compute_attention_latent(z_verts, vertex_mass)
+        
+        # Apply attention to get attended features
+        attn_output = self.apply_attention_to_value(attention_map, V)  # (B, V, qkv_dim)
+        
+        # Project back to out_c dimensions and add residual connection
+        out = self.attn_proj(attn_output) + x_in
 
         return out, grads
     
 class PoissonNet(nn.Module):
-    def __init__(self, C_in, C_out, C_width=128, n_blocks=4, head=None, extra_features=0, outputs_at='vertices', last_activation=nn.Identity(), config={}, **kwargs):   
+    def __init__(self, C_in, C_out, C_width=128, n_blocks=4, head=None, extra_features=0, outputs_at='vertices', last_activation=nn.Identity(), config={},use_attention=False, **kwargs):   
         super().__init__()
         assert head in ['linear', 'mlp', 'njf', None], f"Invalid head type: {head}. Choose from ['linear', 'mlp', 'njf', None]."
         self.outputs_at = outputs_at
@@ -228,6 +398,9 @@ class PoissonNet(nn.Module):
         self.C_width = C_width
         self.N_block = n_blocks
         self.head_type = head
+        
+        # Check if using attention blocks
+        self.use_attention = use_attention
 
         if extra_features > 0:
             # Extra MLP to process auxiliary features:
@@ -241,7 +414,13 @@ class PoissonNet(nn.Module):
         self.proj_in = nn.Linear(C_in, C_width)
         self.blocks = nn.ModuleList()
         for _ in range(n_blocks):
-            self.blocks.append(PoissonBlock(in_c=C_width, out_c=C_width, width=C_width, extra_feats=extra_features, config=config))
+            if self.use_attention:
+                # Ensure C_width is divisible by 3 for attention
+                if C_width % 3 != 0:
+                    raise ValueError(f"C_width ({C_width}) must be divisible by 3 when using attention blocks")
+                self.blocks.append(PoissonBlockWithAttention(in_c=C_width, out_c=C_width, width=C_width, extra_feats=extra_features, config=config))
+            else:
+                self.blocks.append(PoissonBlock(in_c=C_width, out_c=C_width, width=C_width, extra_feats=extra_features, config=config))
 
         self.head = nn.Identity()
         if head == 'njf':

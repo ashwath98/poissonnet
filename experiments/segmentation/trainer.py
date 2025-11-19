@@ -34,7 +34,7 @@ exp_name = config['exp_name']
 os.makedirs(os.path.join('results', exp_name), exist_ok=True)
 outfile = lambda x: os.path.join('results', exp_name, x)
 
-data_dir = './smplx_data'
+data_dir = '/home/ashwathshetty/3DVision/GP/mesh_data'
 train_dataset = MOYOSegmentationDataset(data_dir=data_dir, train=True, config=config)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 train_loader = cycle(train_loader)

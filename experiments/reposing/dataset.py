@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 
 class MOYOBakedDataset(Dataset):
     def __init__(self, data_dir, train, config):
-        data_pack = 'train_baked_hands_16000_5.0.pt' if train else 'val_baked_hands_2000_5.0.pt'
+        data_pack = 'train_baked_hands_1_5.0.pt' if train else 'val_baked_hands_1_5.0.pt' #
         data_pack = torch.load(os.path.join(data_dir, data_pack))
         self.src_verts = data_pack['src_verts']
         self.tar_verts = data_pack['tar_verts']
